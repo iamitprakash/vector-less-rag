@@ -8,13 +8,17 @@ class AsyncVectorlessEngine:
     def __init__(self, model: str = "llama3.1:latest"):
         self.model = model
 
-    async def chat(self, prompt: str) -> str:
-        """Async wrapper for ollama.chat"""
-        # Note: ollama library is currently synchronous, we use run_in_executor
+    async def chat(self, prompt: str, system: Optional[str] = None) -> str:
+        """Async wrapper for ollama.chat with optional system prompt"""
+        messages = []
+        if system:
+            messages.append({'role': 'system', 'content': system})
+        messages.append({'role': 'user', 'content': prompt})
+        
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None, 
-            lambda: ollama.chat(model=self.model, messages=[{'role': 'user', 'content': prompt}])
+            lambda: ollama.chat(model=self.model, messages=messages)
         )
         return response['message']['content'].strip()
 
@@ -24,24 +28,32 @@ class AsyncVectorlessEngine:
         if not documents:
             return []
         
-        doc_list = "\n".join([f"- ID: {doc.id}, Name: {doc.filename}" for doc in documents])
+        # If only one document exists, we might want to just pick it, 
+        # but let's let the LLM decide for consistency.
+        
+        doc_list = "\n".join([f"ID: {doc.id} - {doc.filename}" for doc in documents])
+        system_prompt = "You are a specialized retrieval assistant. Your ONLY job is to return a comma-separated list of document IDs. DO NOT provide any explanation or conversational text."
         prompt = f"""
-        Given the following list of documents:
+        Documents available:
         {doc_list}
         
-        Which of these documents (IDs) are likely to contain information to answer this question: "{query}"?
-        Return only a comma-separated list of IDs. If none are relevant, return "None".
+        Query: "{query}"
+        
+        Which IDs are relevant? (Return only IDs or "None")
         """
         
-        content = await self.chat(prompt)
+        content = await self.chat(prompt, system=system_prompt)
         if content.lower() == "none":
             return []
         
-        try:
-            ids = [int(i.strip()) for i in content.split(",") if i.strip().isdigit()]
-            return db.query(Document).filter(Document.id.in_(ids)).all()
-        except:
+        # Robust parsing: extract all integers from the response
+        import re
+        found_ids = [int(match) for match in re.findall(r'\b\d+\b', content)]
+        
+        if not found_ids:
             return []
+            
+        return db.query(Document).filter(Document.id.in_(found_ids)).all()
 
     async def check_page_relevance(self, query: str, doc_name: str, page_num: int, page_content: str) -> Optional[Dict[str, Any]]:
         """Checks if a single page is relevant."""
