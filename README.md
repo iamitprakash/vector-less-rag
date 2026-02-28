@@ -2,6 +2,9 @@
 
 An enterprise-grade, local-first RAG (Retrieval-Augmented Generation) system that uses LLM reasoning instead of vector embeddings. Inspired by `roe-ai/vectorless`.
 
+<img width="2034" height="1243" alt="Screenshot 2026-02-28 at 6 57 52 PM" src="https://github.com/user-attachments/assets/dd5b294a-a2f4-4e31-83db-a505031438d9" />
+
+
 ## 🚀 Key Features
 
 - **Vectorless Reasoning**: Uses local Ollama models (`llama3.1`) to navigate document libraries via "Smart Selection" and "Page Detection" rather than mathematical vector similarity.
