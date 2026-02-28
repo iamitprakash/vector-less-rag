@@ -16,6 +16,7 @@ class Document(Base):
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String, unique=True, index=True)
     description = Column(Text, nullable=True)
+    summary = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
     
     pages = relationship("Page", back_populates="document", cascade="all, delete-orphan")

@@ -18,6 +18,7 @@ class PageSchema(PageBase):
 class DocumentBase(BaseModel):
     filename: str
     description: Optional[str] = None
+    summary: Optional[str] = None
 
 class DocumentCreate(DocumentBase):
     pass

@@ -39,13 +39,19 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
             db.refresh(db_doc)
         
         # Add new pages
+        pages_content = []
         for i, page in enumerate(reader.pages):
+            content = page.extract_text()
+            pages_content.append(content)
             db_page = Page(
                 document_id=db_doc.id,
                 page_number=i+1,
-                content=page.extract_text()
+                content=content
             )
             db.add(db_page)
+        
+        # Generate summary
+        db_doc.summary = await engine.summarize_document(file.filename, pages_content)
         
         db.commit()
         db.refresh(db_doc)
