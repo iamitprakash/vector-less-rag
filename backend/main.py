@@ -66,6 +66,14 @@ async def list_documents(db: Session = Depends(get_db)):
 
 @app.post("/query", response_model=QueryResponse)
 async def query_rag(request: QueryRequest, db: Session = Depends(get_db)):
+    # Step 0: Check Cache
+    cached_result = await engine.get_cached_query(db, request.query)
+    if cached_result:
+        return QueryResponse(
+            answer=cached_result["answer"],
+            sources=cached_result["sources"]
+        )
+
     # Step 1: Select documents (if not specified)
     if not request.document_ids:
         selected_docs = await engine.select_documents(db, request.query)
@@ -80,6 +88,9 @@ async def query_rag(request: QueryRequest, db: Session = Depends(get_db)):
     
     # Step 3: Generate answer
     answer = await engine.generate_answer(request.query, relevant_pages)
+    
+    # Step 4: Cache result
+    await engine.cache_query(db, request.query, answer, relevant_pages)
     
     return QueryResponse(
         answer=answer,

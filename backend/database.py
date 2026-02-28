@@ -31,6 +31,15 @@ class Page(Base):
     
     document = relationship("Document", back_populates="pages")
 
+class QueryCache(Base):
+    __tablename__ = "query_cache"
+
+    id = Column(Integer, primary_key=True, index=True)
+    query = Column(String, index=True)
+    answer = Column(Text)
+    sources = Column(Text) # JSON string of sources
+    created_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 

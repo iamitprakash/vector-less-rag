@@ -23,17 +23,19 @@ class AsyncVectorlessEngine:
         """
         return await self.chat(prompt)
 
-    async def chat(self, prompt: str, system: Optional[str] = None) -> str:
-        """Async wrapper for ollama.chat with optional system prompt"""
+    async def chat(self, prompt: str, system: Optional[str] = None, json_mode: bool = False) -> str:
+        """Async wrapper for ollama.chat with optional system prompt and JSON mode"""
         messages = []
         if system:
             messages.append({'role': 'system', 'content': system})
         messages.append({'role': 'user', 'content': prompt})
         
+        options = {"format": "json"} if json_mode else {}
+        
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None, 
-            lambda: ollama.chat(model=self.model, messages=messages)
+            lambda: ollama.chat(model=self.model, messages=messages, **options)
         )
         return response['message']['content'].strip()
 
@@ -47,30 +49,37 @@ class AsyncVectorlessEngine:
         # but let's let the LLM decide for consistency.
         
         doc_list = "\n".join([f"ID: {doc.id} | Name: {doc.filename} | Summary: {doc.summary or 'No summary'}" for doc in documents])
-        system_prompt = "You are a specialized retrieval assistant. Your ONLY job is to return a comma-separated list of document IDs. DO NOT provide any explanation or conversational text."
+        system_prompt = """
+        You are a specialized retrieval assistant. 
+        Your ONLY job is to return a JSON object containing a list of relevant document IDs.
+        Format: {"relevant_ids": [1, 2, ...]}
+        If none are relevant, return {"relevant_ids": []}
+        """
         prompt = f"""
-        Select the most relevant document IDs for the query.
+        Select relevant document IDs for the query.
         
         Documents:
         {doc_list}
         
         Query: "{query}"
-        
-        Return only IDs or "None":
         """
         
-        content = await self.chat(prompt, system=system_prompt)
-        if content.lower() == "none":
-            return []
+        content = await self.chat(prompt, system=system_prompt, json_mode=True)
         
-        # Robust parsing: extract all integers from the response
-        import re
-        found_ids = [int(match) for match in re.findall(r'\b\d+\b', content)]
-        
-        if not found_ids:
-            return []
-            
-        return db.query(Document).filter(Document.id.in_(found_ids)).all()
+        try:
+            import json
+            data = json.loads(content)
+            found_ids = data.get("relevant_ids", [])
+            if not found_ids:
+                return []
+            return db.query(Document).filter(Document.id.in_(found_ids)).all()
+        except:
+            # Fallback to robust regex if JSON fails or structure is wrong
+            import re
+            found_ids = [int(match) for match in re.findall(r'\b\d+\b', content)]
+            if not found_ids:
+                return []
+            return db.query(Document).filter(Document.id.in_(found_ids)).all()
 
     async def check_page_relevance(self, query: str, doc_name: str, page_num: int, page_content: str) -> Optional[Dict[str, Any]]:
         """Checks if a single page is relevant."""
@@ -93,58 +102,86 @@ class AsyncVectorlessEngine:
         return None
 
     async def detect_relevant_pages(self, query: str, selected_docs: List[Document]) -> List[Dict[str, Any]]:
-        """Step 2: Scans pages in batches to reduce LLM calls."""
+        """Step 2: Hierarchical scanning to reduce LLM calls for large docs."""
         all_relevant_pages = []
-        semaphore = asyncio.Semaphore(2) # Stricter limit for batching to prevent timeouts
+        semaphore = asyncio.Semaphore(2)
         
-        async def process_batch(doc_name: str, batch: List[Page]):
+        async def fast_pass(doc_name: str, batch: List[Page]):
+            """Pass 1: Quick check over a larger batch (10 pages)"""
             batch_text = ""
             for p in batch:
-                batch_text += f"\n--- PAGE {p.page_number} ---\n{p.content[:1000]}\n"
+                batch_text += f"\n[P{p.page_number}]: {p.content[:500]}\n"
             
-            system_prompt = "You are a page detection assistant. Identify which specific page numbers contain relevant information for the query."
-            prompt = f"""
-            Document: {doc_name}
-            Batch Content:
-            {batch_text}
-            
-            Query: "{query}"
-            
-            Which page numbers in this batch are relevant? 
-            Return a comma-separated list of page numbers or "None". 
-            DO NOT explain.
+            system_prompt = """
+            You are a fast-pass retrieval assistant. Identify page numbers that MIGHT contain answers.
+            Return JSON: {"potential_pages": [1, 5, 10, ...]}
+            If none, return {"potential_pages": []}
             """
+            prompt = f"Query: {query}\n\nBatch Content:\n{batch_text}"
             
             async with semaphore:
-                content = await self.chat(prompt, system=system_prompt)
+                content = await self.chat(prompt, system=system_prompt, json_mode=True)
             
-            if content.lower() == "none" or not content:
+            try:
+                import json
+                return json.loads(content).get("potential_pages", [])
+            except:
                 return []
-            
-            import re
-            found_pages = [int(match) for match in re.findall(r'\b\d+\b', content)]
-            
-            relevant = []
-            for p_num in found_pages:
-                page_obj = next((p for p in batch if p.page_number == p_num), None)
-                if page_obj:
-                    relevant.append({
-                        "source": doc_name,
-                        "page": page_obj.page_number,
-                        "content": page_obj.content
-                    })
-            return relevant
 
-        tasks = []
-        batch_size = 3
+        async def deep_scan(doc_name: str, batch: List[Page]):
+            """Pass 2: Detailed check on promising pages."""
+            batch_text = ""
+            for p in batch:
+                batch_text += f"\n--- PAGE {p.page_number} ---\n{p.content[:1500]}\n"
+            
+            system_prompt = """
+            Verify if these specific pages contain the answer.
+            Return JSON: {"relevant_pages": [1, 2, ...]}
+            """
+            prompt = f"Query: {query}\n\nPromising Pages:\n{batch_text}"
+            
+            async with semaphore:
+                content = await self.chat(prompt, system=system_prompt, json_mode=True)
+            
+            try:
+                import json
+                relevant_nums = json.loads(content).get("relevant_pages", [])
+                return [p for p in batch if p.page_number in relevant_nums]
+            except:
+                return []
+
         for doc in selected_docs:
-            for i in range(0, len(doc.pages), batch_size):
-                batch = doc.pages[i:i + batch_size]
-                tasks.append(process_batch(doc.filename, batch))
-        
-        results = await asyncio.gather(*tasks)
-        for r_list in results:
-            all_relevant_pages.extend(r_list)
+            # Step 2a: Fast Pass (10 pages per batch)
+            potential_page_nums = []
+            fast_tasks = []
+            batch_size_fast = 10
+            for i in range(0, len(doc.pages), batch_size_fast):
+                batch = doc.pages[i:i + batch_size_fast]
+                fast_tasks.append(fast_pass(doc.filename, batch))
+            
+            results = await asyncio.gather(*fast_tasks)
+            for r in results:
+                potential_page_nums.extend(r)
+            
+            if not potential_page_nums:
+                continue
+                
+            # Step 2b: Deep Scan (3 promising pages per batch)
+            promising_pages = [p for p in doc.pages if p.page_number in potential_page_nums]
+            deep_tasks = []
+            batch_size_deep = 3
+            for i in range(0, len(promising_pages), batch_size_deep):
+                batch = promising_pages[i:i + batch_size_deep]
+                deep_tasks.append(deep_scan(doc.filename, batch))
+            
+            deep_results = await asyncio.gather(*deep_tasks)
+            for r_list in deep_results:
+                for p_obj in r_list:
+                    all_relevant_pages.append({
+                        "source": doc.filename,
+                        "page": p_obj.page_number,
+                        "content": p_obj.content
+                    })
             
         return all_relevant_pages
 
@@ -169,3 +206,32 @@ class AsyncVectorlessEngine:
         """
         
         return await self.chat(prompt)
+
+    async def get_cached_query(self, db: Session, query: str) -> Optional[Dict[str, Any]]:
+        """Checks if a normalized version of the query exists in cache."""
+        from .database import QueryCache
+        import json
+        
+        normalized_query = query.strip().lower()
+        cached = db.query(QueryCache).filter(QueryCache.query == normalized_query).first()
+        
+        if cached:
+            return {
+                "answer": cached.answer,
+                "sources": json.loads(cached.sources)
+            }
+        return None
+
+    async def cache_query(self, db: Session, query: str, answer: str, sources: List[Dict[str, Any]]):
+        """Stores a query result in the persistent cache."""
+        from .database import QueryCache
+        import json
+        
+        normalized_query = query.strip().lower()
+        new_cache = QueryCache(
+            query=normalized_query,
+            answer=answer,
+            sources=json.dumps(sources)
+        )
+        db.add(new_cache)
+        db.commit()
