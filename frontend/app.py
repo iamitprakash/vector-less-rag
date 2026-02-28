@@ -1,6 +1,11 @@
+import uuid
 import streamlit as st
 import requests
 import json
+
+# Session ID for Phase 4
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
 BASE_URL = "http://localhost:8000"
 
@@ -58,21 +63,34 @@ if prompt := st.chat_input("Ask a question about the enterprise library..."):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.status("Querying Enterprise API...", expanded=True) as status:
-            st.write("🛰 Sending request to FastAPI...")
-            payload = {"query": prompt}
+        # Phase 4: Thought Trace Container
+        thought_container = st.expander("🔬 Engine X-Ray (Thought Trace)", expanded=True)
+        thought_log = thought_container.empty()
+        thoughts = []
+
+        with st.status("Thinking...", expanded=False) as status:
+            payload = {
+                "query": prompt,
+                "session_id": st.session_state.session_id
+            }
             
             try:
                 response = requests.post(f"{BASE_URL}/query", json=payload, stream=True)
                 
                 if response.status_code == 200:
-                    status.update(label="Retrieval successful, generating answer...", state="running")
+                    status.update(label="Processing...", state="running")
                     
                     # Streaming display
                     def stream_viewer():
                         full_content = ""
                         sources_raw = None
                         for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
+                            if "THOUGHT:" in chunk:
+                                thought_line = chunk.replace("THOUGHT:", "").strip()
+                                thoughts.append(f"- {thought_line}")
+                                thought_log.markdown("\n".join(thoughts))
+                                continue
+                                
                             if "SOURCES_METADATA:" in chunk:
                                 parts = chunk.split("SOURCES_METADATA:")
                                 yield parts[0]
@@ -85,6 +103,7 @@ if prompt := st.chat_input("Ask a question about the enterprise library..."):
                     
                     answer = st.write_stream(stream_viewer())
                     status.update(label="Complete!", state="complete", expanded=False)
+                    thought_container.update(expanded=False) # Collapse thoughts on finish
                     
                     st.session_state.messages.append({"role": "assistant", "content": answer})
                     

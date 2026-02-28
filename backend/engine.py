@@ -2,7 +2,7 @@ import asyncio
 import ollama
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
-from .database import Document, Page
+from .database import Document, Page, Chunk, ChatMessage
 
 class AsyncVectorlessEngine:
     def __init__(self, model: str = "llama3.1:latest"):
@@ -39,6 +39,71 @@ class AsyncVectorlessEngine:
             return await self.chat(prompt, system=system_prompt, json_mode=True)
         except:
             return "{}"
+
+    async def chunk_document(self, filename: str, pages: List[Page]) -> List[Dict[str, Any]]:
+        """Phase 4: Semantic chunking with overlap."""
+        chunks = []
+        full_text = ""
+        page_map = [] # To track which character belongs to which page
+        
+        current_pos = 0
+        for p in pages:
+            full_text += p.content + "\n"
+            page_map.append((current_pos, current_pos + len(p.content) + 1, p.page_number))
+            current_pos += len(p.content) + 1
+            
+        # Chunking: ~1500 chars with 300 char overlap
+        chunk_size = 1500
+        overlap = 300
+        
+        start = 0
+        while start < len(full_text):
+            end = start + chunk_size
+            content = full_text[start:end]
+            
+            # Find pages involved in this chunk
+            pages_involved = set()
+            for p_start, p_end, p_num in page_map:
+                if not (end <= p_start or start >= p_end):
+                    pages_involved.add(p_num)
+            
+            p_min = min(pages_involved) if pages_involved else 0
+            p_max = max(pages_involved) if pages_involved else 0
+            page_range = f"{p_min}-{p_max}"
+            
+            chunks.append({
+                "content": content,
+                "page_range": page_range
+            })
+            
+            if end >= len(full_text):
+                break
+            start += (chunk_size - overlap)
+            
+        return chunks
+
+    async def refine_query(self, query: str, history: List[ChatMessage]) -> str:
+        """Phase 4: Resolves pronouns and context using chat history."""
+        if not history:
+            return query
+            
+        history_text = "\n".join([f"{m.role.upper()}: {m.content}" for m in history[-5:]]) # Last 5 messages
+        
+        system_prompt = """
+        You are a query refinement assistant. 
+        Based on the chat history, rewrite the user's latest query to be a standalone search query.
+        Resolve pronouns (he, she, it, they, that project, then) to their actual entities.
+        IF the query is already standalone, return it as is.
+        Return JSON: {"standalone_query": "..."}
+        """
+        prompt = f"History:\n{history_text}\n\nLatest Query: {query}"
+        
+        try:
+            content = await self.chat(prompt, system=system_prompt, json_mode=True)
+            import json
+            return json.loads(content).get("standalone_query", query)
+        except:
+            return query
 
     async def chat(self, prompt: str, system: Optional[str] = None, json_mode: bool = False, stream: bool = False) -> Any:
         """Async wrapper for ollama.chat with optional system prompt, JSON mode, and streaming"""
