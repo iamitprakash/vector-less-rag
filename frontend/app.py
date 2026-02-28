@@ -61,23 +61,40 @@ if prompt := st.chat_input("Ask a question about the enterprise library..."):
         with st.status("Querying Enterprise API...", expanded=True) as status:
             st.write("🛰 Sending request to FastAPI...")
             payload = {"query": prompt}
-            response = requests.post(f"{BASE_URL}/query", json=payload)
             
-            if response.status_code == 200:
-                data = response.json()
-                answer = data["answer"]
-                sources = data["sources"]
-                status.update(label="Response received!", state="complete", expanded=False)
+            try:
+                response = requests.post(f"{BASE_URL}/query", json=payload, stream=True)
                 
-                st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-                
-                if sources:
-                    with st.expander("Enterprise Sources"):
-                        for s in sources:
-                            st.markdown(f"- **{s['source']}** (Page {s['page']})")
-            else:
-                status.update(label="API Error", state="error", expanded=False)
-                error_msg = f"Error: {response.json().get('detail', 'Unknown error')}"
-                st.error(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                if response.status_code == 200:
+                    status.update(label="Retrieval successful, generating answer...", state="running")
+                    
+                    # Streaming display
+                    def stream_viewer():
+                        full_content = ""
+                        sources_raw = None
+                        for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
+                            if "SOURCES_METADATA:" in chunk:
+                                parts = chunk.split("SOURCES_METADATA:")
+                                yield parts[0]
+                                sources_raw = parts[1]
+                                break
+                            yield chunk
+                        
+                        if sources_raw:
+                            st.session_state.last_sources = json.loads(sources_raw)["sources"]
+                    
+                    answer = st.write_stream(stream_viewer())
+                    status.update(label="Complete!", state="complete", expanded=False)
+                    
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                    
+                    if "last_sources" in st.session_state:
+                        with st.expander("Enterprise Sources"):
+                            for s in st.session_state.last_sources:
+                                st.markdown(f"- **{s['source']}** (Page {s['page']})")
+                else:
+                    status.update(label="API Error", state="error", expanded=False)
+                    st.error(f"Error: {response.text}")
+            except Exception as e:
+                status.update(label="Connection Error", state="error", expanded=False)
+                st.error(f"Could not connect to backend: {e}")

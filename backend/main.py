@@ -50,8 +50,9 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
             )
             db.add(db_page)
         
-        # Generate summary
+        # Phase 3: Metadata + Summary
         db_doc.summary = await engine.summarize_document(file.filename, pages_content)
+        db_doc.metadata_json = await engine.extract_metadata(file.filename, pages_content)
         
         db.commit()
         db.refresh(db_doc)
@@ -64,7 +65,10 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
 async def list_documents(db: Session = Depends(get_db)):
     return db.query(Document).all()
 
-@app.post("/query", response_model=QueryResponse)
+from fastapi.responses import StreamingResponse
+import json
+
+@app.post("/query")
 async def query_rag(request: QueryRequest, db: Session = Depends(get_db)):
     # Step 0: Check Cache
     cached_result = await engine.get_cached_query(db, request.query)
@@ -74,28 +78,42 @@ async def query_rag(request: QueryRequest, db: Session = Depends(get_db)):
             sources=cached_result["sources"]
         )
 
-    # Step 1: Select documents (if not specified)
-    if not request.document_ids:
-        selected_docs = await engine.select_documents(db, request.query)
-    else:
-        selected_docs = db.query(Document).filter(Document.id.in_(request.document_ids)).all()
+    # Phase 3 Step 1: Query Expansion
+    query_variations = await engine.expand_query(request.query)
+    
+    # Step 2: Select documents (using all variations)
+    all_selected_docs = []
+    for q in query_variations:
+        docs = await engine.select_documents(db, q)
+        all_selected_docs.extend(docs)
+    
+    # Deduplicate docs
+    doc_ids = {doc.id for doc in all_selected_docs}
+    selected_docs = db.query(Document).filter(Document.id.in_(doc_ids)).all()
     
     if not selected_docs:
         raise HTTPException(status_code=404, detail="No relevant documents found.")
     
-    # Step 2: Detect relevant pages
+    # Step 3: Detect relevant pages (using original query for precision)
     relevant_pages = await engine.detect_relevant_pages(request.query, selected_docs)
     
-    # Step 3: Generate answer
-    answer = await engine.generate_answer(request.query, relevant_pages)
-    
-    # Step 4: Cache result
-    await engine.cache_query(db, request.query, answer, relevant_pages)
-    
-    return QueryResponse(
-        answer=answer,
-        sources=[{"source": p["source"], "page": p["page"]} for p in relevant_pages]
-    )
+    # Step 4: Generate Streaming Answer
+    async def stream_generator():
+        combined_answer = ""
+        stream = await engine.generate_answer(request.query, relevant_pages, stream=True)
+        
+        async for chunk in stream:
+            combined_answer += chunk
+            yield chunk
+            
+        # After stream ends, yield sources for the frontend to parse
+        sources_json = json.dumps({"sources": [{"source": p["source"], "page": p["page"]} for p in relevant_pages]})
+        yield f"\n\nSOURCES_METADATA:{sources_json}"
+        
+        # Cache the full result
+        await engine.cache_query(db, request.query, combined_answer, relevant_pages)
+
+    return StreamingResponse(stream_generator(), media_type="text/plain")
 
 if __name__ == "__main__":
     import uvicorn

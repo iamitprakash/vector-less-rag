@@ -10,21 +10,38 @@ class AsyncVectorlessEngine:
 
     async def summarize_document(self, filename: str, pages_content: List[str]) -> str:
         """Generates a brief summary of the document based on its first few pages."""
-        # Use first 3 pages for context (or fewer if doc is short)
-        context = "\n\n".join(pages_content[:3])
-        prompt = f"""
-        Document Filename: {filename}
-        
-        Content (first few pages):
-        {context[:4000]}
-        
-        Generate a 2-sentence summary of what this document is about. 
-        Focus on the main topic and purpose.
-        """
-        return await self.chat(prompt)
+        try:
+            # Use first 3 pages for context (or fewer if doc is short)
+            context = "\n\n".join(pages_content[:3])
+            prompt = f"""
+            Document Filename: {filename}
+            
+            Content (first few pages):
+            {context[:4000]}
+            
+            Generate a 2-sentence summary of what this document is about. 
+            Focus on the main topic and purpose.
+            """
+            return await self.chat(prompt)
+        except:
+            return "Summary generation failed."
 
-    async def chat(self, prompt: str, system: Optional[str] = None, json_mode: bool = False) -> str:
-        """Async wrapper for ollama.chat with optional system prompt and JSON mode"""
+    async def extract_metadata(self, filename: str, pages_content: List[str]) -> str:
+        """Extracts key entities, dates, and topics for faster filtering."""
+        try:
+            context = "\n\n".join(pages_content[:3]) # Use first 3 pages
+            system_prompt = """
+            You are a metadata extraction assistant. 
+            Identify key entities (names, company, projects, tech stack) and any date ranges mentioned.
+            Return JSON: {"entities": ["A", "B"], "dates": ["2024", "Jan 2023"], "topics": ["C", "D"]}
+            """
+            prompt = f"Document: {filename}\nContent:\n{context[:4000]}"
+            return await self.chat(prompt, system=system_prompt, json_mode=True)
+        except:
+            return "{}"
+
+    async def chat(self, prompt: str, system: Optional[str] = None, json_mode: bool = False, stream: bool = False) -> Any:
+        """Async wrapper for ollama.chat with optional system prompt, JSON mode, and streaming"""
         messages = []
         if system:
             messages.append({'role': 'system', 'content': system})
@@ -32,12 +49,48 @@ class AsyncVectorlessEngine:
         
         options = {"format": "json"} if json_mode else {}
         
+        if stream:
+            # We need to run the iterator in a thread but consume it as an async generator
+            def sync_stream():
+                return ollama.chat(model=self.model, messages=messages, stream=True, **options)
+            
+            loop = asyncio.get_event_loop()
+            sync_gen = await loop.run_in_executor(None, sync_stream)
+            
+            async def async_gen():
+                for chunk in sync_gen:
+                    if 'message' in chunk and 'content' in chunk['message']:
+                        yield chunk['message']['content']
+            return async_gen()
+
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None, 
             lambda: ollama.chat(model=self.model, messages=messages, **options)
         )
         return response['message']['content'].strip()
+
+    async def expand_query(self, query: str) -> List[str]:
+        """Generates 2-3 variations of the query to broaden search coverage."""
+        system_prompt = """
+        You are a search query expansion assistant. 
+        Generate 2-3 alternative search queries based on the user's input.
+        Focus on synonyms and related technical concepts.
+        Return JSON: {"variations": ["query 1", "query 2", ...]}
+        """
+        prompt = f"Original Query: {query}"
+        
+        try:
+            content = await self.chat(prompt, system=system_prompt, json_mode=True)
+            import json
+            data = json.loads(content)
+            variations = data.get("variations", [])
+            # Include original query
+            if query not in variations:
+                variations.append(query)
+            return variations[:4] # Limit to 4 total
+        except:
+            return [query]
 
     async def select_documents(self, db: Session, query: str) -> List[Document]:
         """Step 1: LLM selects relevant documents."""
@@ -185,10 +238,14 @@ class AsyncVectorlessEngine:
             
         return all_relevant_pages
 
-    async def generate_answer(self, query: str, context_pages: List[Dict[str, Any]]) -> str:
-        """Step 3: Generate final answer."""
+    async def generate_answer(self, query: str, context_pages: List[Dict[str, Any]], stream: bool = False) -> Any:
+        """Step 3: Generate final answer (item support for streaming)."""
         if not context_pages:
-            return "I couldn't find any relevant information in the uploaded documents."
+            error_msg = "I couldn't find any relevant information in the uploaded documents."
+            if stream:
+                async def empty_gen(): yield error_msg
+                return empty_gen()
+            return error_msg
         
         context_text = ""
         for p in context_pages:
@@ -205,7 +262,7 @@ class AsyncVectorlessEngine:
         Answer:
         """
         
-        return await self.chat(prompt)
+        return await self.chat(prompt, stream=stream)
 
     async def get_cached_query(self, db: Session, query: str) -> Optional[Dict[str, Any]]:
         """Checks if a normalized version of the query exists in cache."""

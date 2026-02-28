@@ -17,6 +17,7 @@ class Document(Base):
     filename = Column(String, unique=True, index=True)
     description = Column(Text, nullable=True)
     summary = Column(Text, nullable=True)
+    metadata_json = Column(Text, nullable=True) # Store JSON of entities, dates, etc.
     created_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
     
     pages = relationship("Page", back_populates="document", cascade="all, delete-orphan")

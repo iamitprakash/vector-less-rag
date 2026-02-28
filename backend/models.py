@@ -19,6 +19,7 @@ class DocumentBase(BaseModel):
     filename: str
     description: Optional[str] = None
     summary: Optional[str] = None
+    metadata_json: Optional[str] = None
 
 class DocumentCreate(DocumentBase):
     pass
