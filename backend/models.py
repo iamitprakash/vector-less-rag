@@ -62,6 +62,7 @@ class QueryRequest(BaseModel):
     query: str
     document_ids: Optional[List[int]] = None
     session_id: Optional[str] = None # Added for Phase 4
+    comparison_mode: bool = False # Added for Phase 5
 
 class QueryResponse(BaseModel):
     answer: str

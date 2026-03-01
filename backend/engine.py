@@ -231,7 +231,8 @@ class AsyncVectorlessEngine:
                 batch_text += f"\n[P{p.page_number}]: {p.content[:500]}\n"
             
             system_prompt = """
-            You are a fast-pass retrieval assistant. Identify page numbers that MIGHT contain answers.
+            You are a fast-pass retrieval assistant. Identify page numbers that are relevant to the query.
+            If the query is broad (e.g. "summarize", "about this", "depth"), pick pages that look like introductions, tables of contents, or overviews.
             Return JSON: {"potential_pages": [1, 5, 10, ...]}
             If none, return {"potential_pages": []}
             """
@@ -253,7 +254,7 @@ class AsyncVectorlessEngine:
                 batch_text += f"\n--- PAGE {p.page_number} ---\n{p.content[:1500]}\n"
             
             system_prompt = """
-            Verify if these specific pages contain the answer.
+            Verify if these specific pages contain the answer OR provide a good overview for a summary request.
             Return JSON: {"relevant_pages": [1, 2, ...]}
             """
             prompt = f"Query: {query}\n\nPromising Pages:\n{batch_text}"
@@ -273,19 +274,26 @@ class AsyncVectorlessEngine:
             potential_page_nums = []
             fast_tasks = []
             batch_size_fast = 10
-            for i in range(0, len(doc.pages), batch_size_fast):
-                batch = doc.pages[i:i + batch_size_fast]
+            # Sort pages to ensure order
+            sorted_pages = sorted(doc.pages, key=lambda x: x.page_number)
+            for i in range(0, len(sorted_pages), batch_size_fast):
+                batch = sorted_pages[i:i + batch_size_fast]
                 fast_tasks.append(fast_pass(doc.filename, batch))
             
             results = await asyncio.gather(*fast_tasks)
             for r in results:
                 potential_page_nums.extend(r)
             
+            # Phase 5 Fallback: If no pages found but query is broad, take first 5 pages
+            is_broad = any(word in query.lower() for word in ["summarize", "about", "depth", "overview", "who is", "what is"])
+            if not potential_page_nums and is_broad:
+                potential_page_nums = [p.page_number for p in sorted_pages[:5]]
+            
             if not potential_page_nums:
                 continue
                 
             # Step 2b: Deep Scan (3 promising pages per batch)
-            promising_pages = [p for p in doc.pages if p.page_number in potential_page_nums]
+            promising_pages = [p for p in sorted_pages if p.page_number in potential_page_nums]
             deep_tasks = []
             batch_size_deep = 3
             for i in range(0, len(promising_pages), batch_size_deep):
@@ -298,7 +306,8 @@ class AsyncVectorlessEngine:
                     all_relevant_pages.append({
                         "source": doc.filename,
                         "page": p_obj.page_number,
-                        "content": p_obj.content
+                        "content": p_obj.content,
+                        "doc_summary": doc.summary # Pass summary for extra context
                     })
             
         return all_relevant_pages
@@ -328,6 +337,34 @@ class AsyncVectorlessEngine:
         """
         
         return await self.chat(prompt, stream=stream)
+
+    async def synthesize_comparison(self, query: str, context_pages: List[Dict[str, Any]], stream: bool = False) -> Any:
+        """Phase 5: Generates a comparative synthesis across multiple documents."""
+        if not context_pages:
+            return "I couldn't find enough information to perform a comparison."
+            
+        context_text = ""
+        for p in context_pages:
+            context_text += f"\n--- Source: {p['source']} (Page {p['page']}) ---\n{p['content']}\n"
+            
+        system_prompt = """
+        You are a Document Synthesis Expert. 
+        Your goal is to compare and contrast information across multiple documents.
+        1. Create a clear Markdown table for side-by-side comparisons where possible.
+        2. Summarize key differences and similarities.
+        3. ALWAYS cite your sources using [DocName, Page X] format.
+        4. Be objective and professional.
+        """
+        
+        prompt = f"""
+        User Query: {query}
+        
+        Context from various documents:
+        {context_text}
+        
+        Provide a comprehensive synthesis and comparison based on the query.
+        """
+        return await self.chat(prompt, system=system_prompt, stream=stream)
 
     async def get_cached_query(self, db: Session, query: str) -> Optional[Dict[str, Any]]:
         """Checks if a normalized version of the query exists in cache."""

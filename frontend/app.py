@@ -49,6 +49,10 @@ with st.sidebar:
         for doc in st.session_state.docs:
             st.text(f"📄 {doc['filename']} (ID: {doc['id']})")
     
+    # Phase 5: Comparison Mode
+    st.subheader("⚙️ Agent Settings")
+    comparison_mode = st.toggle("📊 Comparison Mode (Synthesis)", value=False, help="Analyze multiple documents side-by-side.")
+    
     st.divider()
     st.info("Backend: FastAPI | Engine: Ollama (Async)")
 
@@ -71,7 +75,8 @@ if prompt := st.chat_input("Ask a question about the enterprise library..."):
         with st.status("Thinking...", expanded=False) as status:
             payload = {
                 "query": prompt,
-                "session_id": st.session_state.session_id
+                "session_id": st.session_state.session_id,
+                "comparison_mode": comparison_mode # Phase 5
             }
             
             try:
@@ -103,14 +108,34 @@ if prompt := st.chat_input("Ask a question about the enterprise library..."):
                     
                     answer = st.write_stream(stream_viewer())
                     status.update(label="Complete!", state="complete", expanded=False)
-                    thought_container.update(expanded=False) # Collapse thoughts on finish
+                    # thought_container.update(expanded=False) # Removed: invalid command
                     
                     st.session_state.messages.append({"role": "assistant", "content": answer})
                     
                     if "last_sources" in st.session_state:
                         with st.expander("Enterprise Sources"):
                             for s in st.session_state.last_sources:
-                                st.markdown(f"- **{s['source']}** (Page {s['page']})")
+                                col1, col2 = st.columns([3, 1])
+                                col1.markdown(f"- **{s['source']}** (Page {s['page']})")
+                                if col2.button("👁️ Show Preview", key=f"preview_{s['source']}_{s['page']}"):
+                                    # Fetch page image (Need doc_id, find it from session state or query backend)
+                                    # For simplicity, we search session state docs
+                                    doc_id = None
+                                    if "docs" in st.session_state:
+                                        for d in st.session_state.docs:
+                                            if d['filename'] == s['source']:
+                                                doc_id = d['id']
+                                                break
+                                    
+                                    if doc_id:
+                                        img_res = requests.get(f"{BASE_URL}/page-image/{doc_id}/{s['page']}")
+                                        if img_res.status_code == 200:
+                                            img_b64 = img_res.json()["image_base64"]
+                                            st.image(base64.b64decode(img_b64), caption=f"{s['source']} - Page {s['page']}")
+                                        else:
+                                            st.error("Could not load preview.")
+                                    else:
+                                        st.error("Document reference missing.")
                 else:
                     status.update(label="API Error", state="error", expanded=False)
                     st.error(f"Error: {response.text}")

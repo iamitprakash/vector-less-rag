@@ -6,6 +6,8 @@ from pypdf import PdfReader
 from .database import SessionLocal, init_db, get_db, Document, Page, Chunk, ChatMessage
 from .models import DocumentSchema, QueryRequest, QueryResponse
 from .engine import AsyncVectorlessEngine
+import fitz # PyMuPDF
+import base64
 
 app = FastAPI(title="Enterprise Vectorless RAG API")
 
@@ -15,6 +17,28 @@ engine = AsyncVectorlessEngine()
 @app.on_event("startup")
 def startup_event():
     init_db()
+
+@app.get("/page-image/{document_id}/{page_number}")
+async def get_page_image(document_id: int, page_number: int, db: Session = Depends(get_db)):
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    file_path = f"data/documents/{doc.filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+        
+    try:
+        pdf_doc = fitz.open(file_path)
+        # fitz uses 0-indexed pages, our DB uses 1-indexed
+        page = pdf_doc.load_page(page_number - 1)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # Higher res
+        img_data = pix.tobytes("png")
+        base64_img = base64.b64encode(img_data).decode("utf-8")
+        pdf_doc.close()
+        return {"image_base64": base64_img}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/upload", response_model=DocumentSchema)
 async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -66,6 +90,11 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
         
         db.commit()
         db.refresh(db_doc)
+
+        # Phase 5: Persist file for image extraction
+        final_doc_path = f"data/documents/{file.filename}"
+        shutil.copy(temp_path, final_doc_path)
+        
         return db_doc
     finally:
         if os.path.exists(temp_path):
@@ -127,12 +156,16 @@ async def query_rag(request: QueryRequest, db: Session = Depends(get_db)):
             yield "I couldn't find any specific sections that answer your question."
             return
 
-        # Step 4: Generate Streaming Answer
-        yield f"THOUGHT: Generating answer from {len(relevant_pages)} relevant sources...\n"
+        # Step 3: Generate Answer (Streaming)
         combined_answer = ""
-        stream = await engine.generate_answer(refined_query, relevant_pages, stream=True)
-        
-        async for chunk in stream:
+        if request.comparison_mode:
+            yield "THOUGHT: Synthesizing information for comparison...\n"
+            answer_stream = await engine.synthesize_comparison(refined_query, relevant_pages, stream=True)
+        else:
+            yield f"THOUGHT: Generating answer from {len(relevant_pages)} relevant sources...\n"
+            answer_stream = await engine.generate_answer(refined_query, relevant_pages, stream=True)
+            
+        async for chunk in answer_stream:
             combined_answer += chunk
             yield chunk
             
